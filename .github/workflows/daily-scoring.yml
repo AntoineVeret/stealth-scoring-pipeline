@@ -1,0 +1,31 @@
+name: Daily Stealth Scoring
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scoring pipeline
+        env:
+          PHANTOMBUSTER_API_KEY: ${{ secrets.PHANTOMBUSTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          PB_AGENT_STEALTH_FR_BE: ${{ secrets.PB_AGENT_STEALTH_FR_BE }}
+          PB_AGENT_COMPANY_FOUNDERS: ${{ secrets.PB_AGENT_COMPANY_FOUNDERS }}
+        run: python score_leads.py
