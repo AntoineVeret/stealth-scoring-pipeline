@@ -46,15 +46,28 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
     }
     params = {"id": agent_id}
 
+    # Step 1: Get the latest container ID and check for resultObject
     resp = requests.get(
         "https://api.phantombuster.com/api/v2/agents/fetch-output",
         headers=headers, params=params,
     )
     resp.raise_for_status()
     data = resp.json()
+    container_id = data.get("containerId")
 
-     # resultObject contains the CSV URL; output is console log text
-    result_url = data.get("resultObject")
+    # Step 2: Try resultObject from the container
+    result_url = None
+    if container_id:
+        cont_resp = requests.get(
+            "https://api.phantombuster.com/api/v2/containers/fetch-result-object",
+            headers=headers, params={"id": container_id},
+        )
+        if cont_resp.ok:
+            ro = cont_resp.json().get("resultObject")
+            if ro and isinstance(ro, str) and ro.startswith("http"):
+                result_url = ro
+
+    # Step 3: Fallback to s3 storage URL
     if not result_url:
         resp2 = requests.get(
             "https://api.phantombuster.com/api/v2/agents/fetch",
@@ -70,11 +83,17 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
             result_url = f"https://cache1.phantombooster.com/{s3}/result.csv"
 
     if not result_url:
-        log.warning(f"No results found for agent {agent_id}")
+        log.warning(f"No result URL found for agent {agent_id}")
         return []
 
-    csv_resp = requests.get(result_url, headers={"X-Phantombuster-Key": PHANTOMBUSTER_API_KEY})
-    csv_resp.raise_for_status()
+    log.info(f"Fetching CSV from {result_url}")
+    try:
+        csv_resp = requests.get(result_url)
+        csv_resp.raise_for_status()
+    except requests.HTTPError as e:
+        log.warning(f"Could not fetch CSV for agent {agent_id}: {e}")
+        return []
+
     reader = csv.DictReader(io.StringIO(csv_resp.text))
     return list(reader)
 
