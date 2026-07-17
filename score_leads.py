@@ -63,8 +63,11 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
         resp2.raise_for_status()
         agent_data = resp2.json()
         s3 = agent_data.get("s3Folder")
-        if s3:
-            result_url = f"https://cache1.phantombuster.com/{s3}/result.csv"
+        org_s3 = agent_data.get("orgS3Folder")
+        if s3 and org_s3:
+            result_url = f"https://cache1.phantombooster.com/{org_s3}/{s3}/result.csv"
+        elif s3:
+            result_url = f"https://cache1.phantombooster.com/{s3}/result.csv"
 
     if not result_url:
         log.warning(f"No results found for agent {agent_id}")
