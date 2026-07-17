@@ -73,7 +73,7 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
         log.warning(f"No results found for agent {agent_id}")
         return []
 
-    csv_resp = requests.get(result_url)
+    csv_resp = requests.get(result_url, headers={"X-Phantombuster-Key": PHANTOMBUSTER_API_KEY})
     csv_resp.raise_for_status()
     reader = csv.DictReader(io.StringIO(csv_resp.text))
     return list(reader)
