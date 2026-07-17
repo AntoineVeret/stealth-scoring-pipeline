@@ -53,7 +53,8 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
     resp.raise_for_status()
     data = resp.json()
 
-    result_url = data.get("output") or data.get("resultObject")
+     # resultObject contains the CSV URL; output is console log text
+    result_url = data.get("resultObject")
     if not result_url:
         resp2 = requests.get(
             "https://api.phantombuster.com/api/v2/agents/fetch",
