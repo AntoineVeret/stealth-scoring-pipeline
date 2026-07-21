@@ -164,6 +164,16 @@ class NotionClient:
             safe_to_retry=False,
         )
 
+    def update_page(self, page_id: str, properties: dict[str, Any]) -> dict[str, Any]:
+        """Idempotently replace selected properties on an existing page."""
+        normalized_page_id = normalize_notion_id(page_id)
+        return self._request_json(
+            "PATCH",
+            f"/pages/{normalized_page_id}",
+            json={"properties": properties},
+            safe_to_retry=True,
+        )
+
     def url_exists(self, property_name: str, url: str) -> bool:
         filter_ = {"property": property_name, "url": {"equals": url}}
         return next(self.query_pages(filter_=filter_, page_size=1), None) is not None

@@ -1,8 +1,9 @@
 """Reliable PhantomBuster -> Notion intake pipeline.
 
 The job downloads each PhantomBuster agent's hosted result file, rejects error
-rows, canonicalizes LinkedIn profile URLs, deduplicates both within the run and
-against Notion, then writes clean profiles with status "À scorer".
+rows, canonicalizes LinkedIn profile URLs, deduplicates profiles across both
+exports, then upserts complete CSV-backed records into Notion. Existing rows are
+backfilled without overwriting Claude's scoring fields or status.
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ PB_S3_BASE = "https://phantombuster.s3.amazonaws.com"
 PB_LEGACY_CACHE_BASE = "https://cache1.phantombooster.com"
 PARIS_TZ = ZoneInfo("Europe/Paris")
 SCORING_PAYLOAD_VERSION = "2026-07-21"
+FULL_RAW_PAYLOAD_VERSION = "2026-07-21-full-export-v1"
+NOTION_RICH_TEXT_CHUNK_SIZE = 1900
+NOTION_RICH_TEXT_MAX_OBJECTS = 100
 EXPECTED_AGENT_NAMES = {
     "Stealth founders FR/BE": "Stealth founders FR:BE - Extraction data profil",
     "Company founders FR/BE": "Company founders FR:BE - Extraction data profil",
@@ -179,9 +183,9 @@ class PhantomBusterClient:
 
         attempted = "; ".join(attempts[-12:]) or "no candidate URL was attempted"
         custom_hint = (
-            f" Current override: {config.result_filename}."
+            f" Current explicit filename override: {config.result_filename}."
             if config.result_filename
-            else " Set the matching PB_RESULT_FILE_* secret if this Phantom uses a custom output filename."
+            else " Verify that the secret contains the Agent ID of the profile-data extraction Phantom."
         )
         raise PhantomBusterError(
             f"{config.label}: no valid hosted result file could be downloaded. "
@@ -644,7 +648,7 @@ def validate_profile_export_schema(rows: list[dict[str, Any]], label: str) -> No
     if missing:
         raise RuntimeError(
             f"{label}: the downloaded file is not the profile-extraction export; "
-            f"missing {', '.join(missing)}. Check the PB_RESULT_FILE secret or Phantom output filename."
+            f"missing {', '.join(missing)}. Check that the configured Phantom is the profile-data extraction agent."
         )
 
 
@@ -698,32 +702,68 @@ def build_scoring_payload(profile: dict[str, Any]) -> dict[str, Any]:
     return compact_dict(payload)
 
 
+def build_full_notion_payload(profile: dict[str, Any]) -> dict[str, Any]:
+    """Return the complete scoring record written to Notion.
+
+    ``scoring_input`` is normalized for Claude, while ``raw_exports`` preserves
+    every original CSV column and value for every valid source row. Nothing is
+    truncated or discarded when a profile appears in both PhantomBuster lists.
+    """
+    raw_exports = profile.get("raw_rows") or [
+        {
+            "source": source,
+            "row": {key: value for key, value in profile["raw"].items() if key != SOURCE_FIELD},
+        }
+        for source in (profile.get("sources") or [""])
+    ]
+    return {
+        "schema_version": FULL_RAW_PAYLOAD_VERSION,
+        "scoring_input": build_scoring_payload(profile),
+        "raw_exports": raw_exports,
+    }
+
+
 def clean_profiles(
     rows: list[dict[str, Any]],
-    existing_urls: set[str],
+    existing_urls: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], CleanStats]:
+    """Clean and deduplicate profiles without dropping existing Notion rows.
+
+    Existing profiles are returned as well so the pipeline can PATCH their
+    ``Raw data`` property. This is required to backfill complete CSV data into
+    rows that were created by earlier versions of the pipeline.
+    """
+    existing_urls = existing_urls or set()
     stats = CleanStats(input_rows=len(rows))
     profiles_by_url: dict[str, dict[str, Any]] = {}
     ordered_urls: list[str] = []
 
-    for row in rows:
-        if row_has_error(row):
+    for annotated_row in rows:
+        if row_has_error(annotated_row):
             stats.error_rows += 1
             continue
-        url = extract_linkedin_url(row)
+        url = extract_linkedin_url(annotated_row)
         if not url:
             stats.missing_url += 1
             continue
-        name = extract_name(row)
+        name = extract_name(annotated_row)
         if not name:
             stats.missing_name += 1
             continue
 
-        source = text_field(row, SOURCE_FIELD, max_length=300)
+        source = text_field(annotated_row, SOURCE_FIELD, max_length=300)
+        # Preserve exactly the columns returned by PhantomBuster. The synthetic
+        # source marker is stored alongside the row, not inside it.
+        raw_row = {
+            key: value for key, value in annotated_row.items() if key != SOURCE_FIELD
+        }
+        raw_export = {"source": source, "row": raw_row}
+
         if url in profiles_by_url:
             stats.duplicate_in_run += 1
             current = profiles_by_url[url]
-            current["raw"] = merge_raw_rows(current["raw"], row)
+            current["raw"] = merge_raw_rows(current["raw"], raw_row)
+            current["raw_rows"].append(raw_export)
             if source and source not in current["sources"]:
                 current["sources"].append(source)
             current["name"] = extract_name(current["raw"]) or current["name"]
@@ -732,42 +772,49 @@ def clean_profiles(
         profiles_by_url[url] = {
             "name": name,
             "linkedin_url": url,
-            "raw": dict(row),
+            "raw": raw_row,
+            "raw_rows": [raw_export],
             "sources": [source] if source else [],
         }
         ordered_urls.append(url)
 
-    clean: list[dict[str, Any]] = []
-    for url in ordered_urls:
-        profile = profiles_by_url[url]
-        if url in existing_urls:
-            stats.duplicate_in_notion += 1
-            continue
-        clean.append(profile)
-
+    clean = [profiles_by_url[url] for url in ordered_urls]
+    stats.duplicate_in_notion = sum(1 for url in ordered_urls if url in existing_urls)
     stats.accepted = len(clean)
     return clean, stats
 
 
-def get_existing_linkedin_urls(notion: NotionClient) -> set[str]:
-    urls: set[str] = set()
+def get_existing_linkedin_pages(notion: NotionClient) -> dict[str, list[str]]:
+    """Map each canonical LinkedIn URL to all matching Notion page IDs."""
+    pages_by_url: dict[str, list[str]] = {}
     for page in notion.query_pages():
         prop = page.get("properties", {}).get("URL LinkedIn", {})
         value = prop.get("url")
-        if isinstance(value, str):
-            canonical = canonical_linkedin_url(value)
-            if canonical:
-                urls.add(canonical)
-    return urls
+        page_id = str(page.get("id") or "").strip()
+        if not isinstance(value, str) or not page_id:
+            continue
+        canonical = canonical_linkedin_url(value)
+        if canonical:
+            pages_by_url.setdefault(canonical, []).append(page_id)
+    return pages_by_url
 
 
-def split_rich_text(value: str, chunk_size: int = 1900, max_chunks: int = 50) -> list[dict[str, Any]]:
+def split_rich_text(
+    value: str,
+    chunk_size: int = NOTION_RICH_TEXT_CHUNK_SIZE,
+    max_chunks: int = NOTION_RICH_TEXT_MAX_OBJECTS,
+) -> list[dict[str, Any]]:
+    """Split text within Notion limits and fail rather than truncate data."""
+    if chunk_size <= 0 or chunk_size > 2000:
+        raise ValueError("Notion rich-text chunks must contain 1 to 2,000 characters")
     chunks = [value[index : index + chunk_size] for index in range(0, len(value), chunk_size)]
+    chunks = chunks or [""]
     if len(chunks) > max_chunks:
-        chunks = chunks[:max_chunks]
-        chunks[-1] = chunks[-1][: chunk_size - 16] + "\n...[truncated]"
-    return [{"type": "text", "text": {"content": chunk}} for chunk in chunks or [""]]
-
+        raise ValueError(
+            f"Raw data requires {len(chunks)} rich-text objects, exceeding the Notion "
+            f"limit of {max_chunks}; refusing to truncate any CSV data"
+        )
+    return [{"type": "text", "text": {"content": chunk}} for chunk in chunks]
 
 def status_property(property_type: str) -> dict[str, Any]:
     if property_type == "status":
@@ -778,9 +825,11 @@ def status_property(property_type: str) -> dict[str, Any]:
 def build_notion_properties(
     profile: dict[str, Any],
     notion: NotionClient,
+    *,
+    include_status: bool,
 ) -> dict[str, Any]:
-    scoring_json = json.dumps(
-        build_scoring_payload(profile),
+    full_json = json.dumps(
+        build_full_notion_payload(profile),
         ensure_ascii=False,
         sort_keys=False,
         indent=2,
@@ -791,11 +840,13 @@ def build_notion_properties(
             "title": [{"type": "text", "text": {"content": profile["name"][:2000]}}]
         },
         "URL LinkedIn": {"url": profile["linkedin_url"]},
-        "Statut": status_property(notion.property_type("Statut") or "select"),
-        # Raw data now contains a stable, compact scoring payload rather than
-        # 110 mostly irrelevant PhantomBuster columns and media URLs.
-        "Raw data": {"rich_text": split_rich_text(scoring_json)},
+        # This single field contains both a normalized Claude input and every
+        # original column/value from every valid CSV source row.
+        "Raw data": {"rich_text": split_rich_text(full_json)},
     }
+    if include_status:
+        properties["Statut"] = status_property(notion.property_type("Statut") or "select")
+
     if notion.property_type("Date d'import") == "date":
         properties["Date d'import"] = {
             "date": {"start": datetime.now(PARIS_TZ).date().isoformat()}
@@ -814,37 +865,56 @@ def build_notion_properties(
         properties["Source PhantomBuster"] = {
             "rich_text": split_rich_text(", ".join(sources), max_chunks=2)
         }
-
-    if notion.property_type("Raw source data") == "rich_text":
-        full_raw_json = json.dumps(
-            profile["raw"], ensure_ascii=False, sort_keys=True, indent=2, default=str
-        )
-        properties["Raw source data"] = {"rich_text": split_rich_text(full_raw_json)}
     return properties
 
 
-def write_profiles(notion: NotionClient, profiles: list[dict[str, Any]]) -> int:
-    written = 0
+def upsert_profiles(
+    notion: NotionClient,
+    profiles: list[dict[str, Any]],
+    existing_pages: dict[str, list[str]],
+) -> tuple[int, int]:
+    """Create new profiles and backfill every existing matching Notion row."""
+    created = 0
+    updated = 0
     for index, profile in enumerate(profiles, start=1):
-        properties = build_notion_properties(profile, notion)
-        try:
-            notion.create_page(properties)
-        except NotionAPIError as exc:
-            # A transient 5xx after the page was created can make the response ambiguous.
-            # Check by canonical URL before declaring failure or retrying externally.
-            if notion.url_exists("URL LinkedIn", profile["linkedin_url"]):
-                log.warning(
-                    "Notion returned an error for %s, but the URL now exists; treating it as written: %s",
-                    profile["name"],
-                    exc,
-                )
-            else:
-                raise
-        written += 1
-        log.info("Notion write %d/%d: %s", index, len(profiles), profile["name"])
+        page_ids = existing_pages.get(profile["linkedin_url"], [])
+        if page_ids:
+            properties = build_notion_properties(profile, notion, include_status=False)
+            for page_id in page_ids:
+                notion.update_page(page_id, properties)
+                updated += 1
+            log.info(
+                "Notion upsert %d/%d: updated %d existing page(s) for %s",
+                index,
+                len(profiles),
+                len(page_ids),
+                profile["name"],
+            )
+        else:
+            properties = build_notion_properties(profile, notion, include_status=True)
+            try:
+                notion.create_page(properties)
+            except NotionAPIError as exc:
+                # A transient error can be ambiguous after a create. Check by URL
+                # before declaring failure, but never create a second copy.
+                if notion.url_exists("URL LinkedIn", profile["linkedin_url"]):
+                    log.warning(
+                        "Notion returned an error for %s, but the URL now exists; "
+                        "treating it as created: %s",
+                        profile["name"],
+                        exc,
+                    )
+                else:
+                    raise
+            created += 1
+            log.info(
+                "Notion upsert %d/%d: created %s",
+                index,
+                len(profiles),
+                profile["name"],
+            )
         time.sleep(0.35)
-    return written
-
+    return created, updated
 
 def read_agent_configs() -> list[AgentConfig]:
     stealth_label = "Stealth founders FR/BE"
@@ -855,14 +925,14 @@ def read_agent_configs() -> list[AgentConfig]:
             agent_id=normalize_agent_id(require_env("PB_AGENT_STEALTH_FR_BE")),
             secret_name="PB_AGENT_STEALTH_FR_BE",
             expected_agent_name=EXPECTED_AGENT_NAMES[stealth_label],
-            result_filename=os.getenv("PB_RESULT_FILE_STEALTH_FR_BE"),
+            result_filename=None,
         ),
         AgentConfig(
             label=company_label,
             agent_id=normalize_agent_id(require_env("PB_AGENT_COMPANY_FOUNDERS")),
             secret_name="PB_AGENT_COMPANY_FOUNDERS",
             expected_agent_name=EXPECTED_AGENT_NAMES[company_label],
-            result_filename=os.getenv("PB_RESULT_FILE_COMPANY_FOUNDERS"),
+            result_filename=None,
         ),
     ]
 
@@ -918,13 +988,18 @@ def run_pipeline() -> int:
         return 0
 
     log.info("Fetched rows by agent: %s", dict(per_agent))
-    existing_urls = get_existing_linkedin_urls(notion)
-    log.info("Notion currently contains %d canonical LinkedIn URL(s)", len(existing_urls))
-
-    clean, stats = clean_profiles(all_rows, existing_urls)
+    existing_pages = get_existing_linkedin_pages(notion)
+    existing_page_count = sum(len(page_ids) for page_ids in existing_pages.values())
     log.info(
-        "Quality report: input=%d accepted=%d errors=%d missing_url=%d missing_name=%d "
-        "duplicate_in_run=%d duplicate_in_notion=%d",
+        "Notion currently contains %d canonical LinkedIn URL(s) across %d page(s)",
+        len(existing_pages),
+        existing_page_count,
+    )
+
+    clean, stats = clean_profiles(all_rows, set(existing_pages))
+    log.info(
+        "Quality report: input=%d accepted_unique=%d errors=%d missing_url=%d "
+        "missing_name=%d duplicate_in_run=%d existing_in_notion=%d",
         stats.input_rows,
         stats.accepted,
         stats.error_rows,
@@ -934,19 +1009,22 @@ def run_pipeline() -> int:
         stats.duplicate_in_notion,
     )
 
-    valid_before_notion_dedupe = stats.accepted + stats.duplicate_in_notion
-    if valid_before_notion_dedupe == 0 and stats.input_rows > 0:
+    if not clean and stats.input_rows > 0:
         raise RuntimeError(
             "PhantomBuster returned rows, but none had both a valid LinkedIn /in/ URL and a name. "
             "Stopping to avoid silently accepting the wrong export schema."
         )
     if not clean:
-        log.info("No new valid profiles after deduplication")
+        log.info("Both files contained zero usable profiles; nothing to upsert")
         return 0
 
-    written = write_profiles(notion, clean)
-    log.info("=== Stealth intake complete: %d profile(s) written ===", written)
-    return written
+    created, updated = upsert_profiles(notion, clean, existing_pages)
+    log.info(
+        "=== Stealth intake complete: %d created, %d existing page(s) updated ===",
+        created,
+        updated,
+    )
+    return created + updated
 
 
 def main() -> None:

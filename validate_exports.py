@@ -13,7 +13,7 @@ from pathlib import Path
 
 from score_leads import (
     SOURCE_FIELD,
-    build_scoring_payload,
+    build_full_notion_payload,
     clean_profiles,
     validate_profile_export_schema,
 )
@@ -41,9 +41,13 @@ def main() -> None:
         all_rows.extend(rows)
 
     profiles, stats = clean_profiles(all_rows, set())
-    sizes = [
-        len(json.dumps(build_scoring_payload(profile), ensure_ascii=False))
+    payloads = [build_full_notion_payload(profile) for profile in profiles]
+    sizes = [len(json.dumps(payload, ensure_ascii=False)) for payload in payloads]
+    raw_rows = sum(len(profile.get("raw_rows", [])) for profile in profiles)
+    raw_field_counts = [
+        len(export["row"])
         for profile in profiles
+        for export in profile.get("raw_rows", [])
     ]
     print(
         "Quality: "
@@ -53,8 +57,14 @@ def main() -> None:
     if sizes:
         sizes.sort()
         print(
-            "Scoring payload chars: "
+            "Full Notion payload chars: "
             f"min={sizes[0]} median={sizes[len(sizes) // 2]} max={sizes[-1]}"
+        )
+    if raw_field_counts:
+        print(
+            "Raw export preservation: "
+            f"rows={raw_rows} fields_per_row_min={min(raw_field_counts)} "
+            f"fields_per_row_max={max(raw_field_counts)}"
         )
 
 

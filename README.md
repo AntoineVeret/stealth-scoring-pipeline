@@ -1,224 +1,161 @@
 # Stealth Scoring Pipeline
 
-Reliable daily intake of founder profiles from two PhantomBuster agents into Notion, followed by a weekly email containing only profiles that have actually been scored.
+Daily PhantomBuster-to-Notion intake for the Cleo Ventures stealth-founder scoring workflow.
 
-## What this version fixes
+## What this version does
 
-- Downloads PhantomBuster results from the supported hosted-result S3 path rather than guessing `cache1/.../result.csv`.
-- Tries the exact verified output filenames first, then supports `result.csv` / `result.json` and discovered custom filenames.
-- Uses the actual `linkedinProfileUrl` export field, while retaining compatible fallbacks.
-- Removes rows such as `error = Out of Network profile`.
-- Rejects rows without a valid LinkedIn `/in/` URL or founder name.
-- Canonicalizes LinkedIn URLs and deduplicates both within the current run and against all Notion pages. Duplicate profiles found in both Phantom lists are merged, using the freshest scrape and backfilling missing fields from the other list.
-- Fails the action when one configured agent cannot be fetched, instead of silently importing partial data.
-- Uses Notion's current data-source API and paginates all queries.
-- Builds a compact, versioned scoring payload from the real export columns instead of truncating the first 2,000 characters of an arbitrary 110-column row.
-- Keeps `Date de scoring` for the real scoring step; raw imports are marked `À scorer` and can optionally receive `Date d'import`.
-- Sends the weekly email only for rows with both a score and a scoring date.
+The pipeline reads the two profile-data extraction Phantoms:
 
-## Actual workflow
+- `Stealth founders FR:BE - Extraction data profil`
+- `Company founders FR:BE - Extraction data profil`
 
-```text
-PhantomBuster agents
-        │
-        ▼
-score_leads.py (daily)
-fetch → validate → remove error rows → canonicalize → deduplicate
-        │
-        ▼
-Notion rows marked "À scorer" with full raw profile JSON
-        │
-        ▼
-Your Claude/Notion scoring step fills score + rationale + Date de scoring
-        │
-        ▼
-weekly_email.py sends only fully scored rows
-```
+It then:
 
-The repository does **not** invent a scoring rubric. The prior code passed an Anthropic key but never called Anthropic; that unused secret has been removed from the daily action. Add automatic scoring only after the exact rubric and expected JSON schema are committed to the repository.
+1. downloads both result files;
+2. rejects explicit PhantomBuster error rows;
+3. requires a founder name and a canonical LinkedIn `/in/` URL;
+4. deduplicates profiles across both lists;
+5. creates new Notion rows;
+6. **updates existing Notion rows instead of skipping them**;
+7. writes all source data into the existing `Raw data` property.
 
-## Verified PhantomBuster schema
+This last point is the important migration fix. Running the action once backfills the complete CSV data into the rows already visible in the final scoring table.
 
-The implementation was validated against the two exports supplied on 21 July 2026:
+## Exact `Raw data` structure
 
-- 303 raw rows in total;
-- 168 explicit error rows (`Out of Network profile` or `Not a LinkedIn Profile`);
-- 135 valid rows before cross-list deduplication;
-- 5 profiles present in both lists;
-- 130 unique profiles with usable scoring data.
-
-For every accepted profile, `Raw data` contains this stable scoring object:
+Each accepted founder receives one JSON object in `Raw data`:
 
 ```json
 {
-  "schema_version": "2026-07-21",
-  "source": {"lists": [], "scraped_at": ""},
-  "identity": {
-    "full_name": "",
-    "linkedin_url": "",
-    "location": "",
-    "headline": "",
-    "summary": ""
+  "schema_version": "2026-07-21-full-export-v1",
+  "scoring_input": {
+    "schema_version": "2026-07-21",
+    "source": {},
+    "identity": {},
+    "current_role": {},
+    "experience": [],
+    "education": [],
+    "network": {},
+    "contact": {}
   },
-  "current_role": {
-    "title": "",
-    "company_name": "",
-    "company_id": "",
-    "company_url": "",
-    "company_location": "",
-    "company_description": "",
-    "company_website": "",
-    "company_industry": "",
-    "company_headquarters": ""
-  },
-  "experience": [
+  "raw_exports": [
     {
-      "company_name": "",
-      "company_id": "",
-      "title": "",
-      "description": "",
-      "location": "",
-      "duration": "",
-      "date_range": ""
+      "source": "Company founders FR/BE",
+      "row": {
+        "salesNavigatorUrl": "",
+        "firstName": "",
+        "lastName": "",
+        "...": "all remaining CSV columns, including empty values"
+      }
     }
-  ],
-  "education": [
-    {"school_name": "", "degree": "", "date_range": "", "school_url": ""}
-  ],
-  "network": {
-    "connections": 0,
-    "connection_degree": "",
-    "shared_connections": 0
-  },
-  "contact": {"email": "", "websites": []}
+  ]
 }
 ```
 
-Up to five jobs and five schools are retained. Empty values, profile images, company logos, backgrounds and other non-scoring noise are removed.
+`scoring_input` gives Claude a normalized view. `raw_exports` preserves **every one of the 110 CSV columns and its exact value** for every valid row.
+
+When the same person appears in both PhantomBuster lists, both complete source rows are retained in `raw_exports`; they are not collapsed or discarded.
+
+## Validation against the supplied exports
+
+Validated on the two exports supplied on 21 July 2026:
+
+- 303 raw rows;
+- 168 explicit error rows rejected;
+- 135 valid source rows;
+- 5 cross-list duplicates;
+- 130 unique founder profiles;
+- 110 fields preserved for every valid source row;
+- largest complete Notion payload: 29,674 characters.
+
+The pipeline splits `Raw data` into Notion rich-text objects of at most 1,900 characters. It fails loudly instead of truncating if a payload ever exceeds Notion's supported limit.
+
+## Existing rows are now backfilled
+
+Earlier versions skipped a profile whenever its LinkedIn URL already existed in Notion. That left the current 130 rows with only the compact payload shown in the screenshot.
+
+This version performs an upsert:
+
+- **new LinkedIn URL:** create the Notion row and set `Statut = À scorer`;
+- **existing LinkedIn URL:** PATCH `Nom du fondateur`, `URL LinkedIn`, `Raw data`, and optional import/source fields.
+
+Updates do **not** overwrite `Score final`, `Rationale`, `Date de scoring`, `Exit détecté`, `Repeat founder`, `Top employeur`, `Top école`, or the existing `Statut`. Claude's scoring output is therefore preserved.
 
 ## Required Notion properties
-
-### Intake fields
 
 | Property | Type | Required |
 |---|---|---|
 | `Nom du fondateur` | Title | Yes |
 | `URL LinkedIn` | URL | Yes |
-| `Statut` | Select or Status | Yes; must allow `À scorer` |
-| `Raw data` | Rich text | Yes; contains the normalized scoring payload |
+| `Raw data` | Rich text | Yes |
+| `Statut` | Select or Status | Yes; new profiles use `À scorer` |
 | `Date d'import` | Date | Optional |
 | `Source PhantomBuster` | Multi-select, select or rich text | Optional |
-| `Raw source data` | Rich text | Optional; stores the full original row for debugging |
 
-### Scoring/email fields
+Scoring properties used by the final table and weekly email:
 
-| Property | Type | Required for weekly email |
-|---|---|---|
-| `Exit détecté` | Rich text | Optional |
-| `Repeat founder` | Rich text | Optional |
-| `Top école` | Rich text | Optional |
-| `Top employeur` | Rich text | Optional |
-| `Score final` | Number | Yes |
-| `Rationale` | Rich text | Optional |
-| `Date de scoring` | Date | Yes |
+| Property | Type |
+|---|---|
+| `Score final` | Number |
+| `Rationale` | Rich text |
+| `Date de scoring` | Date |
+| `Exit détecté` | Rich text |
+| `Repeat founder` | Rich text |
+| `Top employeur` | Rich text |
+| `Top école` | Rich text |
 
-Share the database with the Notion integration.
-
-## GitHub Action secrets
-
-Required for the daily action:
+## Required GitHub secrets
 
 | Secret | Value |
 |---|---|
 | `PHANTOMBUSTER_API_KEY` | PhantomBuster API key |
-| `PB_AGENT_STEALTH_FR_BE` | Agent ID of **Stealth founders FR:BE - Extraction data profil** |
-| `PB_AGENT_COMPANY_FOUNDERS` | Agent ID of **Company founders FR:BE - Extraction data profil** |
+| `PB_AGENT_STEALTH_FR_BE` | Agent ID of `Stealth founders FR:BE - Extraction data profil` |
+| `PB_AGENT_COMPANY_FOUNDERS` | Agent ID of `Company founders FR:BE - Extraction data profil` |
 | `NOTION_API_KEY` | Notion integration secret |
-| `NOTION_DATABASE_ID` | Notion database ID or full database URL |
+| `NOTION_DATABASE_ID` | Notion database ID or full URL |
 
-Both `PB_AGENT_*` secrets must point to the **profile-data extraction** Phantoms.
-Do not use the upstream Phantom named `Extraction URL LinkedIn`: its S3 folder does
-not contain the profile export, so attempts to download `result.json` or `result.csv`
-will return HTTP 403/404.
+Optional when the Notion database contains multiple data sources:
 
-```text
-Correct: Agent ID from "Company founders FR:BE - Extraction data profil"
-Correct: https://phantombuster.com/phantoms/1234567890123456/setup
-Wrong:   Agent ID from "Company founders FR/BE - Extraction URL LinkedIn"
-Wrong:   https://github.com/.../settings/secrets/actions/PB_AGENT_COMPANY_FOUNDERS
-```
+- `NOTION_DATA_SOURCE_ID`
+- `NOTION_DATA_SOURCE_NAME`
 
-The action logs the resolved Phantom name before downloading anything and stops with a
-clear configuration error when a secret targets the wrong step of the Phantom chain.
+No `PB_RESULT_FILE_*` secret is required.
 
-Optional secrets:
+## Deploy and backfill
 
-| Secret | When to use |
-|---|---|
-| `PB_RESULT_FILE_STEALTH_FR_BE` | Optional override when the S3 object is not `result.json` or `result.csv` |
-| `PB_RESULT_FILE_COMPANY_FOUNDERS` | Optional override when the S3 object is not `result.json` or `result.csv` |
-| `NOTION_DATA_SOURCE_ID` | Recommended when the database contains multiple data sources |
-| `NOTION_DATA_SOURCE_NAME` | Alternative selector for multiple data sources |
-
-Leave the two `PB_RESULT_FILE_*` secrets empty initially. PhantomBuster normally stores
-results as `result.json` and `result.csv`; the filename shown after a browser download may
-be a friendly renamed filename rather than the S3 object key. Add an override only after
-checking the Phantom's file browser or copying its exact CSV link.
-
-Required for the weekly email:
-
-| Secret | Value |
-|---|---|
-| `RESEND_API_KEY` | Resend API key |
-| `EMAIL_TO` | One address or comma-separated addresses |
-| `NOTION_DATABASE_URL` | Link used in the email button |
-| `EMAIL_FROM` | Optional; default is Resend's onboarding sender |
-
-## Fixing HTTP 403 for Company founders
-
-1. Open PhantomBuster.
-2. Open **Company founders FR:BE - Extraction data profil** — not the preceding URL-extraction Phantom.
-3. Copy the numeric Agent ID from the Phantom URL.
-4. In GitHub, open **Settings → Secrets and variables → Actions**.
-5. Replace `PB_AGENT_COMPANY_FOUNDERS` with that Agent ID.
-6. Delete `PB_RESULT_FILE_COMPANY_FOUNDERS`, or leave it empty.
-7. Run **Daily Stealth Intake** manually.
-
-A healthy log starts with a line similar to:
-
-```text
-Company founders FR/BE: resolved PhantomBuster agent 'Company founders FR:BE - Extraction data profil'
-Company founders FR/BE: downloaded result.json ...
-```
-
-## First deployment
-
-Replace the repository contents with this version, then run:
+Replace the repository contents with this version, commit, and run:
 
 ```bash
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-You can validate downloaded exports locally before pushing:
+Then open GitHub:
 
-```bash
-python validate_exports.py "company-export.csv" "stealth-export.csv"
+**Actions → Daily Stealth Intake → Run workflow**
+
+The first successful run should report approximately:
+
+```text
+Quality report: input=303 accepted_unique=130 errors=168 ... duplicate_in_run=5 existing_in_notion=130
+...
+Stealth intake complete: 0 created, 130 existing page(s) updated
 ```
 
-Then push the files and open **Actions → Daily Stealth Intake → Run workflow**.
+The exact existing count depends on the current contents of the Notion table. Open any row afterward and inspect `Raw data`: it should contain both `scoring_input` and `raw_exports`.
 
-A healthy run prints:
+## Local export validation
 
-- a downloaded filename and row count for each PhantomBuster agent;
-- a quality report showing rejected/error/duplicate counts;
-- one Notion write line per new profile.
+```bash
+python validate_exports.py \
+  "result Company founders FR:BE - Extraction data profil.csv" \
+  "result Stealth founders FR:BE - Extraction data profil.csv"
+```
 
-The action exits with a red failure if an agent ID, output filename, result schema, or Notion schema is wrong. This is intentional: a loud failure is safer than a silently incomplete database.
+Expected result for the supplied files:
 
-## Scheduling
-
-GitHub cron is UTC:
-
-- Daily: `30 6 * * *` = 08:30 Paris during summer, 07:30 during winter.
-- Weekly: `0 18 * * 0` = Sunday 20:00 Paris during summer, 19:00 during winter.
+```text
+Quality: input=303 errors=168 duplicates=5 unique=130
+Full Notion payload chars: min=4209 median=11976 max=29674
+Raw export preservation: rows=135 fields_per_row_min=110 fields_per_row_max=110
+```
