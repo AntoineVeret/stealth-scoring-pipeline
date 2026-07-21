@@ -131,29 +131,39 @@ Required for the daily action:
 | Secret | Value |
 |---|---|
 | `PHANTOMBUSTER_API_KEY` | PhantomBuster API key |
-| `PB_AGENT_STEALTH_FR_BE` | Agent ID, or the full PhantomBuster Phantom URL |
-| `PB_AGENT_COMPANY_FOUNDERS` | Agent ID, or the full PhantomBuster Phantom URL |
+| `PB_AGENT_STEALTH_FR_BE` | Agent ID of **Stealth founders FR:BE - Extraction data profil** |
+| `PB_AGENT_COMPANY_FOUNDERS` | Agent ID of **Company founders FR:BE - Extraction data profil** |
 | `NOTION_API_KEY` | Notion integration secret |
 | `NOTION_DATABASE_ID` | Notion database ID or full database URL |
 
-The value of `PB_AGENT_COMPANY_FOUNDERS` must **not** be the GitHub settings URL. For example:
+Both `PB_AGENT_*` secrets must point to the **profile-data extraction** Phantoms.
+Do not use the upstream Phantom named `Extraction URL LinkedIn`: its S3 folder does
+not contain the profile export, so attempts to download `result.json` or `result.csv`
+will return HTTP 403/404.
 
 ```text
-Correct: 1234567890123456
+Correct: Agent ID from "Company founders FR:BE - Extraction data profil"
 Correct: https://phantombuster.com/phantoms/1234567890123456/setup
+Wrong:   Agent ID from "Company founders FR/BE - Extraction URL LinkedIn"
 Wrong:   https://github.com/.../settings/secrets/actions/PB_AGENT_COMPANY_FOUNDERS
 ```
+
+The action logs the resolved Phantom name before downloading anything and stops with a
+clear configuration error when a secret targets the wrong step of the Phantom chain.
 
 Optional secrets:
 
 | Secret | When to use |
 |---|---|
-| `PB_RESULT_FILE_STEALTH_FR_BE` | Override only; defaults to `result Stealth founders FR:BE - Extraction data profil.csv` |
-| `PB_RESULT_FILE_COMPANY_FOUNDERS` | Override only; defaults to `result Company founders FR:BE - Extraction data profil.csv` |
+| `PB_RESULT_FILE_STEALTH_FR_BE` | Optional override when the S3 object is not `result.json` or `result.csv` |
+| `PB_RESULT_FILE_COMPANY_FOUNDERS` | Optional override when the S3 object is not `result.json` or `result.csv` |
 | `NOTION_DATA_SOURCE_ID` | Recommended when the database contains multiple data sources |
 | `NOTION_DATA_SOURCE_NAME` | Alternative selector for multiple data sources |
 
-An override filename can be entered with or without extension, for example `Stealth founders - output.csv`.
+Leave the two `PB_RESULT_FILE_*` secrets empty initially. PhantomBuster normally stores
+results as `result.json` and `result.csv`; the filename shown after a browser download may
+be a friendly renamed filename rather than the S3 object key. Add an override only after
+checking the Phantom's file browser or copying its exact CSV link.
 
 Required for the weekly email:
 
@@ -163,6 +173,23 @@ Required for the weekly email:
 | `EMAIL_TO` | One address or comma-separated addresses |
 | `NOTION_DATABASE_URL` | Link used in the email button |
 | `EMAIL_FROM` | Optional; default is Resend's onboarding sender |
+
+## Fixing HTTP 403 for Company founders
+
+1. Open PhantomBuster.
+2. Open **Company founders FR:BE - Extraction data profil** — not the preceding URL-extraction Phantom.
+3. Copy the numeric Agent ID from the Phantom URL.
+4. In GitHub, open **Settings → Secrets and variables → Actions**.
+5. Replace `PB_AGENT_COMPANY_FOUNDERS` with that Agent ID.
+6. Delete `PB_RESULT_FILE_COMPANY_FOUNDERS`, or leave it empty.
+7. Run **Daily Stealth Intake** manually.
+
+A healthy log starts with a line similar to:
+
+```text
+Company founders FR/BE: resolved PhantomBuster agent 'Company founders FR:BE - Extraction data profil'
+Company founders FR/BE: downloaded result.json ...
+```
 
 ## First deployment
 
