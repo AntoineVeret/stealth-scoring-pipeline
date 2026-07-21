@@ -16,6 +16,7 @@ from score_leads import (
     extract_name,
     normalize_agent_id,
     parse_result_file,
+    result_file_quality,
     split_rich_text,
     upsert_profiles,
     row_has_error,
@@ -271,8 +272,23 @@ class ProfileCleaningTests(unittest.TestCase):
         chunks = split_rich_text(value)
         reconstructed = "".join(chunk["text"]["content"] for chunk in chunks)
         self.assertEqual(reconstructed, value)
+        self.assertTrue(
+            all(len(chunk["text"]["content"].encode("utf-8")) <= 1800 for chunk in chunks)
+        )
         with self.assertRaisesRegex(ValueError, "refusing to truncate"):
-            split_rich_text("x" * (1900 * 101))
+            split_rich_text("x" * (1800 * 101))
+
+    def test_rich_text_split_handles_multibyte_unicode_regression(self):
+        # Regression for Notion's HTTP 400 where a 1,900-codepoint chunk was
+        # validated as 2,236 units because it contained accented Unicode text.
+        value = ("Expérience à Paris — école supérieure 🚀 " * 900).strip()
+        chunks = split_rich_text(value)
+        reconstructed = "".join(chunk["text"]["content"] for chunk in chunks)
+        self.assertEqual(reconstructed, value)
+        for chunk in chunks:
+            content = chunk["text"]["content"]
+            self.assertLessEqual(len(content.encode("utf-8")), 1800)
+            self.assertLessEqual(len(content), 2000)
 
     def test_upsert_updates_existing_raw_data_without_resetting_score_status(self):
         class FakeNotion:
@@ -353,6 +369,30 @@ class ProfileCleaningTests(unittest.TestCase):
 
 
 class ResultFileTests(unittest.TestCase):
+
+    def test_result_file_quality_prefers_complete_csv_over_compact_json(self):
+        compact_json = [
+            {
+                "fullName": "Founder One",
+                "linkedinProfileUrl": "https://linkedin.com/in/one",
+                "headline": "Founder",
+            }
+        ]
+        complete_csv = compact_json + [
+            {
+                "fullName": "Founder Two",
+                "linkedinProfileUrl": "https://linkedin.com/in/two",
+                "headline": "Founder",
+                "jobDescription1": "Detailed experience",
+            },
+            {
+                "fullName": "Blocked Profile",
+                "linkedinProfileUrl": "https://linkedin.com/in/blocked",
+                "error": "Out of Network profile",
+            },
+        ]
+        self.assertGreater(result_file_quality(complete_csv), result_file_quality(compact_json))
+
     def test_csv_parse_with_bom(self):
         data = "\ufefffullName,linkedinProfileUrl\nJane Doe,https://linkedin.com/in/jane\n"
         rows = parse_result_file("result.csv", data.encode(), {})

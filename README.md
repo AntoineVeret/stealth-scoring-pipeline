@@ -11,7 +11,7 @@ The pipeline reads the two profile-data extraction Phantoms:
 
 It then:
 
-1. downloads both result files;
+1. downloads every available `result.json`/`result.csv` candidate and selects the most complete export;
 2. rejects explicit PhantomBuster error rows;
 3. requires a founder name and a canonical LinkedIn `/in/` URL;
 4. deduplicates profiles across both lists;
@@ -68,7 +68,7 @@ Validated on the two exports supplied on 21 July 2026:
 - 110 fields preserved for every valid source row;
 - largest complete Notion payload: 29,674 characters.
 
-The pipeline splits `Raw data` into Notion rich-text objects of at most 1,900 characters. It fails loudly instead of truncating if a payload ever exceeds Notion's supported limit.
+The pipeline splits `Raw data` into Notion rich-text objects of at most **1,800 UTF-8 bytes**. This is intentionally stricter than Python character counting: accented text and emoji caused Notion to reject a nominal 1,900-character chunk as 2,236 units. The complete payload is reconstructed exactly, and the pipeline fails loudly instead of truncating if it would require more than 100 objects. The supplied exports require at most 20 objects for one founder.
 
 ## Existing rows are now backfilled
 
@@ -132,11 +132,13 @@ python -m unittest discover -s tests -v
 
 Then open GitHub:
 
-**Actions → Daily Stealth Intake → Run workflow**
+**Actions → Daily Stealth Scoring → Run workflow**
 
-The first successful run should report approximately:
+The logs first show each downloadable PhantomBuster candidate and the selected one. When the full CSV objects are available, the successful run should report approximately:
 
 ```text
+Stealth founders FR/BE: selected result.csv with 103 row(s) and 55 unique usable profile(s)
+Company founders FR/BE: selected result.csv with 200 row(s) and 80 unique usable profile(s)
 Quality report: input=303 accepted_unique=130 errors=168 ... duplicate_in_run=5 existing_in_notion=130
 ...
 Stealth intake complete: 0 created, 130 existing page(s) updated

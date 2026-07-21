@@ -36,7 +36,7 @@ PB_LEGACY_CACHE_BASE = "https://cache1.phantombooster.com"
 PARIS_TZ = ZoneInfo("Europe/Paris")
 SCORING_PAYLOAD_VERSION = "2026-07-21"
 FULL_RAW_PAYLOAD_VERSION = "2026-07-21-full-export-v1"
-NOTION_RICH_TEXT_CHUNK_SIZE = 1900
+NOTION_RICH_TEXT_CHUNK_SIZE = 1800  # maximum UTF-8 bytes per text object
 NOTION_RICH_TEXT_MAX_OBJECTS = 100
 EXPECTED_AGENT_NAMES = {
     "Stealth founders FR/BE": "Stealth founders FR:BE - Extraction data profil",
@@ -145,7 +145,12 @@ class PhantomBusterClient:
 
         filenames = stable_unique(filenames)
         attempts: list[str] = []
+        downloaded: list[tuple[tuple[int, int, int], str, list[dict[str, Any]]]] = []
 
+        # Do not return the first downloadable object. PhantomBuster can expose a
+        # compact result.json for the latest execution while result.csv retains the
+        # complete export. Download every discoverable result and keep the one with
+        # the most unique usable profiles, then the most rows/columns as tie-breakers.
         for filename in filenames:
             safe_filename = quote(filename.lstrip("/"), safe="/")
             urls = [
@@ -173,13 +178,30 @@ class PhantomBusterClient:
                     attempts.append(f"{filename}: invalid result ({exc})")
                     continue
 
+                quality = result_file_quality(rows)
+                downloaded.append((quality, filename, rows))
                 log.info(
-                    "%s: downloaded %s with %d row(s)",
+                    "%s: candidate %s has %d row(s), %d unique usable profile(s), %d column(s)",
                     config.label,
                     filename,
                     len(rows),
+                    quality[0],
+                    quality[2],
                 )
-                return rows
+                # The same object is mirrored on the legacy host; once one URL for
+                # this filename succeeds there is no value in downloading its mirror.
+                break
+
+        if downloaded:
+            quality, filename, rows = max(downloaded, key=lambda item: item[0])
+            log.info(
+                "%s: selected %s with %d row(s) and %d unique usable profile(s)",
+                config.label,
+                filename,
+                len(rows),
+                quality[0],
+            )
+            return rows
 
         attempted = "; ".join(attempts[-12:]) or "no candidate URL was attempted"
         custom_hint = (
@@ -418,6 +440,20 @@ def stable_unique(values: Iterable[str]) -> list[str]:
             seen.add(normalized)
             result.append(normalized)
     return result
+
+
+def result_file_quality(rows: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """Rank PhantomBuster outputs by usable profiles, row count and field coverage."""
+    usable_urls: set[str] = set()
+    columns: set[str] = set()
+    for row in rows:
+        columns.update(str(key) for key in row)
+        if row_has_error(row):
+            continue
+        url = extract_linkedin_url(row)
+        if url and extract_name(row):
+            usable_urls.add(url)
+    return len(usable_urls), len(rows), len(columns)
 
 
 def case_insensitive_value(row: dict[str, Any], field_names: Iterable[str]) -> Any:
@@ -804,11 +840,35 @@ def split_rich_text(
     chunk_size: int = NOTION_RICH_TEXT_CHUNK_SIZE,
     max_chunks: int = NOTION_RICH_TEXT_MAX_OBJECTS,
 ) -> list[dict[str, Any]]:
-    """Split text within Notion limits and fail rather than truncate data."""
+    """Split text into Notion-safe UTF-8 chunks without truncating data.
+
+    Notion documents the limit as 2,000 characters, but its validation can count
+    multi-byte Unicode content more aggressively than Python's ``len``. French
+    accents, typographic punctuation and emoji therefore made a 1,900-codepoint
+    chunk fail as 2,236 units. Limiting each object by UTF-8 byte length is stricter
+    and safe for ASCII, accented text and non-BMP characters alike.
+    """
     if chunk_size <= 0 or chunk_size > 2000:
-        raise ValueError("Notion rich-text chunks must contain 1 to 2,000 characters")
-    chunks = [value[index : index + chunk_size] for index in range(0, len(value), chunk_size)]
-    chunks = chunks or [""]
+        raise ValueError("Notion rich-text chunks must contain 1 to 2,000 UTF-8 bytes")
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+
+    for char in value:
+        char_bytes = len(char.encode("utf-8"))
+        if char_bytes > chunk_size:
+            raise ValueError("A single character exceeds the configured Notion chunk size")
+        if current and current_bytes + char_bytes > chunk_size:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(char)
+        current_bytes += char_bytes
+
+    if current or not chunks:
+        chunks.append("".join(current))
+
     if len(chunks) > max_chunks:
         raise ValueError(
             f"Raw data requires {len(chunks)} rich-text objects, exceeding the Notion "
