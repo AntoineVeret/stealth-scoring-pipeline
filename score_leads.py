@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,9 +34,9 @@ PB_S3_BASE = "https://phantombuster.s3.amazonaws.com"
 PB_LEGACY_CACHE_BASE = "https://cache1.phantombooster.com"
 PARIS_TZ = ZoneInfo("Europe/Paris")
 SCORING_PAYLOAD_VERSION = "2026-07-21"
-DEFAULT_RESULT_FILES = {
-    "Stealth founders FR/BE": "result Stealth founders FR:BE - Extraction data profil.csv",
-    "Company founders FR/BE": "result Company founders FR:BE - Extraction data profil.csv",
+EXPECTED_AGENT_NAMES = {
+    "Stealth founders FR/BE": "Stealth founders FR:BE - Extraction data profil",
+    "Company founders FR/BE": "Company founders FR:BE - Extraction data profil",
 }
 SOURCE_FIELD = "_phantombuster_source"
 
@@ -68,6 +69,8 @@ log = logging.getLogger("stealth-intake")
 class AgentConfig:
     label: str
     agent_id: str
+    secret_name: str
+    expected_agent_name: str
     result_filename: str | None = None
 
 
@@ -113,6 +116,8 @@ class PhantomBusterClient:
                 "withAgentObject": "true",
             },
         )
+        validate_agent_metadata(config, metadata)
+
         org_folder = str(metadata.get("orgS3Folder") or "").strip("/")
         agent_folder = str(metadata.get("s3Folder") or "").strip("/")
         if not org_folder or not agent_folder:
@@ -121,9 +126,11 @@ class PhantomBusterClient:
                 "Verify the agent ID and API-key permissions."
             )
 
-        filenames: list[str] = []
+        # PhantomBuster's persistent storage normally uses result.json/result.csv.
+        # A browser download can be renamed to "result <agent name>.csv" even though
+        # that longer display name is not the object key in S3. Try canonical names first.
+        filenames: list[str] = ["result.json", "result.csv"]
         filenames.extend(expand_result_filename(config.result_filename))
-        filenames.extend(["result.json", "result.csv"])
         filenames.extend(discover_result_filenames(metadata))
 
         try:
@@ -205,6 +212,59 @@ class PhantomBusterClient:
         if not isinstance(data, dict):
             raise PhantomBusterError(f"GET {path} returned an unexpected JSON shape")
         return data
+
+
+def normalized_words(value: str) -> set[str]:
+    ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return set(re.findall(r"[a-z0-9]+", ascii_text.casefold()))
+
+
+def agent_display_name(metadata: dict[str, Any]) -> str:
+    for key in ("name", "agentName", "displayName"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def validate_agent_metadata(config: AgentConfig, metadata: dict[str, Any]) -> None:
+    """Catch an upstream URL-collector ID before constructing impossible S3 URLs."""
+    actual_name = agent_display_name(metadata)
+    if not actual_name:
+        log.warning(
+            "%s: PhantomBuster metadata did not include an agent name; ID=%s",
+            config.label,
+            config.agent_id,
+        )
+        return
+
+    log.info(
+        "%s: resolved PhantomBuster agent '%s' (ID %s)",
+        config.label,
+        actual_name,
+        config.agent_id,
+    )
+
+    actual = normalized_words(actual_name)
+    expected = normalized_words(config.expected_agent_name)
+    family = "stealth" if "stealth" in expected else "company"
+    is_expected_family = family in actual and any(word.startswith("founder") for word in actual)
+    is_profile_extractor = (
+        "extraction" in actual
+        and "data" in actual
+        and any(word.startswith("profil") for word in actual)
+    )
+
+    if is_expected_family and is_profile_extractor:
+        return
+
+    raise PhantomBusterError(
+        f"{config.label}: {config.secret_name} points to Phantom '{actual_name}' "
+        f"(ID {config.agent_id}), but this pipeline needs '{config.expected_agent_name}'. "
+        "Open that profile-extraction Phantom in PhantomBuster and replace the GitHub "
+        f"secret {config.secret_name} with its Agent ID. Do not use the upstream "
+        "'Extraction URL LinkedIn' Phantom."
+    )
 
 
 def normalize_agent_id(value: str) -> str:
@@ -793,18 +853,16 @@ def read_agent_configs() -> list[AgentConfig]:
         AgentConfig(
             label=stealth_label,
             agent_id=normalize_agent_id(require_env("PB_AGENT_STEALTH_FR_BE")),
-            result_filename=(
-                os.getenv("PB_RESULT_FILE_STEALTH_FR_BE")
-                or DEFAULT_RESULT_FILES[stealth_label]
-            ),
+            secret_name="PB_AGENT_STEALTH_FR_BE",
+            expected_agent_name=EXPECTED_AGENT_NAMES[stealth_label],
+            result_filename=os.getenv("PB_RESULT_FILE_STEALTH_FR_BE"),
         ),
         AgentConfig(
             label=company_label,
             agent_id=normalize_agent_id(require_env("PB_AGENT_COMPANY_FOUNDERS")),
-            result_filename=(
-                os.getenv("PB_RESULT_FILE_COMPANY_FOUNDERS")
-                or DEFAULT_RESULT_FILES[company_label]
-            ),
+            secret_name="PB_AGENT_COMPANY_FOUNDERS",
+            expected_agent_name=EXPECTED_AGENT_NAMES[company_label],
+            result_filename=os.getenv("PB_RESULT_FILE_COMPANY_FOUNDERS"),
         ),
     ]
 
