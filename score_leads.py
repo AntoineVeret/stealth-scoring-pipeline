@@ -95,7 +95,10 @@ def fetch_phantombuster_results(agent_id: str) -> list[dict]:
         return []
 
     reader = csv.DictReader(io.StringIO(csv_resp.text))
-    return list(reader)
+    rows = list(reader)
+    if rows:
+        log.info(f"CSV fields for agent {agent_id}: {list(rows[0].keys())}")
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -145,10 +148,13 @@ def deduplicate(profiles: list[dict], existing_urls: set[str]) -> list[dict]:
     new = []
     for p in profiles:
         url = (
-            p.get("profileUrl")
+            p.get("defaultProfileUrl")
+            or p.get("profileUrl")
             or p.get("linkedInProfileUrl")
+            or p.get("salesNavigatorUrl")
             or p.get("linkedin")
             or p.get("url")
+            or p.get("query")
             or ""
         )
         if not url:
@@ -174,10 +180,13 @@ def write_raw_to_notion(profiles: list[dict]) -> int:
         ).strip()
 
         linkedin_url = (
-            p.get("profileUrl")
+            p.get("defaultProfileUrl")
+            or p.get("profileUrl")
             or p.get("linkedInProfileUrl")
+            or p.get("salesNavigatorUrl")
             or p.get("linkedin")
             or p.get("url")
+            or p.get("query")
             or ""
         )
 
