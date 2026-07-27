@@ -1,19 +1,14 @@
 # Changelog
 
-## Two-source PhantomBuster import fix
+## v2 — full-profile enrichment and Notion repair
 
-### Fixed
-
-- Replaced the incorrect PhantomBuster fallback host with the documented S3 result path.
-- Added support for `linkedinUrl`, `linkedinProfileUrl`, `linkedInUrl`, Sales Navigator URLs, and unknown columns containing a LinkedIn person-profile URL.
-- Prevented silent partial imports when either required PhantomBuster export is unavailable.
-- Prevented duplicate imports when the same founder appears in both lists.
-- Normalized existing Notion URLs before comparison.
-
-### Added
-
-- Per-source fetch counts and field diagnostics.
-- Source tags in stored raw profile data.
-- GitHub secret validation, including detection of identical agent IDs.
-- Built-in regression tests executed by GitHub Actions.
-- Failure when only a subset of intended Notion records is written.
+- Identified the schema mismatch between the full-profile stealth agent and the URL-only company-founders agent.
+- Added automatic PhantomBuster chaining through `spreadsheetUrl`.
+- Added optional `PB_AGENT_PROFILE_ENRICHER`; defaults to the existing full-profile agent.
+- Uses one-launch-only `bonusArgument` and does not overwrite the Phantom's saved setup.
+- Fetches and merges CSV plus JSON results, preferring richer records.
+- Prevents URL-only profiles from being inserted into Notion.
+- Repairs existing `Unknown` / URL-only Notion rows in place.
+- Preserves full Raw data using multiple rich-text chunks.
+- Adds unresolved-profile warnings instead of silently creating unusable rows.
+- Adds regression tests for enrichment arguments, profile completeness, merging and Notion repairs.

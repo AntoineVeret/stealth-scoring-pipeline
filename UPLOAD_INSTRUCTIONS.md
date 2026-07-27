@@ -1,68 +1,51 @@
-# Upload instructions — two PhantomBuster sources fix
+# Upload instructions
 
-## Files to replace or add
+## 1. Replace these repository files
 
-Upload these files while preserving their paths:
-
-1. Replace `score_leads.py` at the repository root.
-2. Replace `.github/workflows/daily-scoring.yml`.
-3. Add `tests/test_score_leads.py`.
-
-No change is required to `requirements.txt`.
-
-## Why this patch is needed
-
-The previous importer had two independent failure modes:
-
-- Its fallback result URL used `cache1.phantombooster.com`. PhantomBuster's documented result-file location is `phantombuster.s3.amazonaws.com/{orgS3Folder}/{s3Folder}/result.csv`.
-- Its LinkedIn URL mapper did not recognise common fields such as `linkedinUrl` and `linkedinProfileUrl`, so rows could be silently discarded even after the export was downloaded.
-
-The replacement importer fixes both issues and also:
-
-- identifies each source separately in the GitHub Actions log;
-- verifies the two GitHub secrets do not contain the same agent ID;
-- refuses to perform a partial Notion import when one source cannot be fetched;
-- deduplicates profiles across the two PhantomBuster exports;
-- logs rows discarded because they have no recognised LinkedIn profile URL;
-- runs regression tests before the live import.
-
-## GitHub upload steps
-
-1. Open the repository's **Code** tab.
-2. Upload or edit each file at the path listed above.
-3. Commit the changes to `main`.
-4. Open **Actions → Daily Stealth Scoring → Run workflow**.
-5. Open the run and inspect the `Run founder import pipeline` step.
-
-## Expected successful log
-
-A healthy run should contain lines similar to:
+Upload while preserving their paths:
 
 ```text
-Configured PhantomBuster agents: stealth=****1234, company_founders=****5678
-stealth_fr_be: fetched 42 rows
-company_founders: fetched 31 rows
-Source summary: stealth_fr_be=42 rows
-Source summary: company_founders=31 rows
-Combined PhantomBuster rows: 73
-Deduplication summary: total=73 new=... duplicates=... missing_url=...
-Written .../... profiles as 'À scorer'
+score_leads.py
+requirements.txt
+.github/workflows/daily-scoring.yml
+tests/test_score_leads.py
 ```
 
-Zero rows is not automatically an error: an export can be fetched successfully and contain zero rows. The Action fails only when a required export cannot be retrieved or when the Notion write is incomplete.
+The README and changelog are documentation only.
 
-## Secrets to verify
+## 2. GitHub secrets
 
-In **Settings → Secrets and variables → Actions**, confirm these repository secrets exist and are non-empty:
+Keep the five existing secrets unchanged.
 
-- `PHANTOMBUSTER_API_KEY`
-- `NOTION_API_KEY`
-- `NOTION_DATABASE_ID`
-- `PB_AGENT_STEALTH_FR_BE`
-- `PB_AGENT_COMPANY_FOUNDERS`
+No new secret is mandatory. For cleaner separation, duplicate the PhantomBuster agent named approximately `Stealth founders FR/BE - Extraction data profil`, then add its agent ID as:
 
-The last two values must be different PhantomBuster agent IDs.
+```text
+PB_AGENT_PROFILE_ENRICHER
+```
 
-## Important scoring note
+Without that optional secret, the existing full-profile agent is reused for one API launch and its saved configuration is not modified.
 
-This repository's current `score_leads.py` imports profiles into Notion with the status `À scorer`. It does not call the Anthropic API itself. The subsequent score is produced by the separate `stealth-scoring` skill/workflow.
+## 3. Run the repair
+
+In GitHub:
+
+1. Open **Actions**.
+2. Open **Daily Stealth Scoring**.
+3. Click **Run workflow**.
+4. Open the job **Import, enrich and repair founder profiles**.
+
+## 4. Validate the result
+
+In the logs, verify:
+
+- the company URL column is detected as `salesNavigatorUrl`;
+- the enrichment launch completes;
+- `repaired` is greater than zero on the first run;
+- no URL-only row is imported;
+- `unresolved_company` is zero, or only contains profiles PhantomBuster has not processed yet.
+
+In Notion, the July 27 rows should keep the same pages and URLs but change from `Unknown` to actual founder names. Their `Raw data` should contain profile fields such as headline, company, experience or location, and their status should remain `À scorer` until the scoring process runs.
+
+## 5. Important PhantomBuster setup check
+
+The full-profile/enricher Phantom must already work manually with a list of LinkedIn profile URLs. Its LinkedIn session must be valid. The code supplies the company export as `spreadsheetUrl` and selects `salesNavigatorUrl` as the input column for that launch.
