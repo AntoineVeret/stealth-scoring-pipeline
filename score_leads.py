@@ -1,5 +1,5 @@
 """
-Stealth Scoring Pipeline — reliable two-list import.
+Stealth Scoring Pipeline — reliable two-list import and enrichment.
 
 The two PhantomBuster agents do not return the same schema:
 
@@ -11,7 +11,8 @@ Phantom as an enrichment step for company-founder URLs, merges the resulting
 profile data, creates new Notion rows, and repairs existing incomplete rows
 (e.g. rows named "Unknown" containing only salesNavigatorUrl).
 
-Scoring remains downstream: repaired/new rows are set to "À scorer".
+Repaired/new rows are set to "À scorer". The GitHub workflow immediately runs
+score_unscored.py afterward to calculate and write the scores.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ import requests
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 ENRICHMENT_TIMEOUT_SECONDS = int(os.getenv("PB_ENRICHMENT_TIMEOUT_SECONDS", "1800"))
 MAX_NOTION_RICH_TEXT_CHUNKS = 95
-NOTION_TEXT_CHUNK_SIZE = 1_900
+NOTION_TEXT_CHUNK_SIZE = 1_800
 
 PHANTOMBUSTER_API_KEY = os.environ["PHANTOMBUSTER_API_KEY"]
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
@@ -715,14 +716,53 @@ def get_notion_leads() -> dict[str, NotionLead]:
     return leads
 
 
+def _utf16_units(text: str) -> int:
+    """Return the length Notion effectively validates for text content.
+
+    Notion's 2,000-character validation can count astral Unicode characters
+    (notably emoji) as two UTF-16 code units. Python's ``len`` counts those
+    characters as one code point, so slicing by ``len`` alone can still yield
+    a Notion payload reported as >2,000 characters.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _split_notion_text(text: str, max_units: int = NOTION_TEXT_CHUNK_SIZE) -> list[str]:
+    if max_units <= 0:
+        raise ValueError("max_units must be greater than zero")
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+
+    for char in text:
+        char_units = _utf16_units(char)
+        if current and current_units + char_units > max_units:
+            chunks.append("".join(current))
+            current = []
+            current_units = 0
+        current.append(char)
+        current_units += char_units
+
+    if current or not chunks:
+        chunks.append("".join(current))
+    return chunks
+
+
 def _rich_text_chunks(text: str) -> list[dict[str, Any]]:
-    max_chars = MAX_NOTION_RICH_TEXT_CHUNKS * NOTION_TEXT_CHUNK_SIZE
-    if len(text) > max_chars:
-        text = text[: max_chars - 40] + "\n... [truncated by importer]"
+    chunks = _split_notion_text(text)
+    if len(chunks) > MAX_NOTION_RICH_TEXT_CHUNKS:
+        chunks = chunks[:MAX_NOTION_RICH_TEXT_CHUNKS]
+        marker = "\n... [truncated by importer]"
+        last = chunks[-1]
+        while last and _utf16_units(last + marker) > NOTION_TEXT_CHUNK_SIZE:
+            last = last[:-1]
+        chunks[-1] = last + marker
+
     return [
-        {"type": "text", "text": {"content": text[index : index + NOTION_TEXT_CHUNK_SIZE]}}
-        for index in range(0, len(text), NOTION_TEXT_CHUNK_SIZE)
-    ] or [{"type": "text", "text": {"content": ""}}]
+        {"type": "text", "text": {"content": chunk}}
+        for chunk in chunks
+    ]
 
 
 def _profile_properties(profile: dict[str, Any]) -> dict[str, Any]:
@@ -736,9 +776,6 @@ def _profile_properties(profile: dict[str, Any]) -> dict[str, Any]:
         "URL LinkedIn": {"url": linkedin_url},
         "Statut": {"select": {"name": "À scorer"}},
         "Raw data": {"rich_text": _rich_text_chunks(raw_data)},
-        "Date de scoring": {
-            "date": {"start": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
-        },
     }
 
 

@@ -1,0 +1,94 @@
+name: Daily Stealth Scoring
+
+"on":
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-stealth-scoring
+  cancel-in-progress: false
+
+jobs:
+  import-enrich-and-score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate code
+        run: |
+          python -m py_compile score_leads.py score_unscored.py
+          python -m unittest discover -s tests -v
+
+      - name: Validate required GitHub secrets
+        shell: bash
+        env:
+          PHANTOMBUSTER_API_KEY: ${{ secrets.PHANTOMBUSTER_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          PB_AGENT_STEALTH_FR_BE: ${{ secrets.PB_AGENT_STEALTH_FR_BE }}
+          PB_AGENT_COMPANY_FOUNDERS: ${{ secrets.PB_AGENT_COMPANY_FOUNDERS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          for variable in \
+            PHANTOMBUSTER_API_KEY \
+            NOTION_API_KEY \
+            NOTION_DATABASE_ID \
+            PB_AGENT_STEALTH_FR_BE \
+            PB_AGENT_COMPANY_FOUNDERS \
+            ANTHROPIC_API_KEY
+          do
+            if [ -z "${!variable:-}" ]; then
+              echo "::error::$variable is missing or empty"
+              exit 1
+            fi
+          done
+
+          if [ "$PB_AGENT_STEALTH_FR_BE" = "$PB_AGENT_COMPANY_FOUNDERS" ]; then
+            echo "::error::The profile-data and company-URL secrets contain the same agent ID"
+            exit 1
+          fi
+
+      - name: Import, enrich and repair founder profiles
+        env:
+          PYTHONUNBUFFERED: "1"
+          PHANTOMBUSTER_API_KEY: ${{ secrets.PHANTOMBUSTER_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          PB_AGENT_STEALTH_FR_BE: ${{ secrets.PB_AGENT_STEALTH_FR_BE }}
+          PB_AGENT_COMPANY_FOUNDERS: ${{ secrets.PB_AGENT_COMPANY_FOUNDERS }}
+          # Optional: use a duplicated full-profile Phantom. If absent, the
+          # stealth full-profile agent is reused for the one enrichment launch.
+          PB_AGENT_PROFILE_ENRICHER: ${{ secrets.PB_AGENT_PROFILE_ENRICHER }}
+          PB_ENRICHMENT_TIMEOUT_SECONDS: "1800"
+        run: python score_leads.py
+
+      - name: Score every complete row marked À scorer
+        if: ${{ always() }}
+        env:
+          PYTHONUNBUFFERED: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # Optional repository variables. Blank values fall back to safe defaults.
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          SCORING_MAX_PROFILES: ${{ vars.SCORING_MAX_PROFILES }}
+          SCORING_ENABLE_WEB_SEARCH: "true"
+          SCORING_REQUEST_TIMEOUT_SECONDS: "180"
+        run: python score_unscored.py
