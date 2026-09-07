@@ -28,4 +28,5 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           PB_AGENT_STEALTH_FR_BE: ${{ secrets.PB_AGENT_STEALTH_FR_BE }}
           PB_AGENT_COMPANY_FOUNDERS: ${{ secrets.PB_AGENT_COMPANY_FOUNDERS }}
+          PB_ENRICHMENT_TIMEOUT_SECONDS: "3600"
         run: python score_leads.py
